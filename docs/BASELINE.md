@@ -33,4 +33,40 @@ Stockfish: version 18, `UCI_LimitStrength` + `UCI_Elo`, Hash=32 Threads=1.
 ## Raw artifacts
 
 `tools/results/bench_20260913T185443Z.json`,
-`tools/results/match_20260913T185555Z.json` (gitignored; rerun to reproduce).
+`tools/results/match_20260913T185555Z.json` (4-game smoke),
+`tools/results/match_20260913T185902Z.json` (10-game calibration)
+(gitignored; rerun to reproduce).
+
+---
+
+# v0.2 real search (this milestone, numbers filling in)
+
+Engine: negamax alpha-beta, iterative deepening, capture quiescence with
+check evasions, PV/MVV-LVA/killer/history ordering, tapered PST eval.
+Matches play the release build; protocol tests use either build.
+
+## Correctness
+
+- `cargo test`: **45/45 pass** (adds perft startpos 1–4 + kiwipete 1–3,
+  mate-in-1 finding, info-per-iteration, movetime respect, determinism,
+  sequential-position regression); clippy `-D warnings` clean, fmt clean
+- UCI compliance CLI: **60/60 pass** (adds `sequential_searches`: back-to-back
+  searches on one engine must each see their own board — this check fails on
+  the pre-fix loop, which dropped `position` commands arriving right after
+  `bestmove` and played illegal stale moves in real games); pytest: 15/15
+- Tactical suites re-verified (unchanged data)
+
+## Speed and tactics (`bench.py`, debug build)
+
+- 199 positions, handshake 0.43 ms, mean 4.17 ms/pos, p95 7.90 ms/pos,
+  239.9 pos/s at `go depth 1` (protocol + real search now)
+- mate_in_1: **20/20 (100%)**; mate_in_2: **7/10 (70%)** at 200 ms/position —
+  clears the "mate-in-1 mostly solved" gate
+
+## Matches vs Stockfish (release build, 10+0.1)
+
+- v0.1 design bug found by the gate match: the command loop dropped
+  `position` commands arriving after a finished-but-unreaped search, so the
+  engine replayed stale moves (0–50 with illegal-move forfeits). Fixed,
+  regression-tested, rerun below.
+- Calibration vs Stockfish `UCI_Elo=1320`: result pending (25 pairs running).

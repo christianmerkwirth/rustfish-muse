@@ -6,7 +6,9 @@
 
 use shakmaty::fen::Fen;
 use shakmaty::uci::UciMove;
-use shakmaty::{CastlingMode, Chess, EnPassantMode, Position as ShakmatyPosition};
+use shakmaty::{
+    Board, CastlingMode, Chess, Color, EnPassantMode, Move, Position as ShakmatyPosition,
+};
 
 /// Owned chess position.
 #[derive(Clone, Debug)]
@@ -78,15 +80,49 @@ impl Position {
     }
 
     /// Number of legal moves from the current position.
-    /// Used by the search and test harness (next milestone wires it in).
+    /// Used by unit tests (production code consumes the move lists directly).
     #[allow(dead_code)]
     pub fn legal_move_count(&self) -> usize {
         self.inner.legal_moves().len()
     }
 
-    /// Access the underlying `shakmaty` position (for search/eval work).
-    /// Used by the search and test harness (next milestone wires it in).
-    #[allow(dead_code)]
+    /// Side to move.
+    pub fn turn(&self) -> Color {
+        self.inner.turn()
+    }
+
+    /// True when the side to move is in check.
+    pub fn is_check(&self) -> bool {
+        self.inner.is_check()
+    }
+
+    /// Halfmove clock (plies since last pawn move or capture).
+    pub fn halfmoves(&self) -> u32 {
+        self.inner.halfmoves()
+    }
+
+    /// True for checkmate, stalemate, insufficient material or the
+    /// seventy-five-move rule — positions with no meaningful search.
+    pub fn is_game_over(&self) -> bool {
+        self.inner.is_game_over()
+    }
+
+    /// Direct board access for evaluation.
+    pub fn board(&self) -> &Board {
+        self.inner.board()
+    }
+
+    /// All legal moves in generation order.
+    pub fn legal_moves(&self) -> Vec<Move> {
+        self.inner.legal_moves().into_iter().collect()
+    }
+
+    /// The position after playing a legal move.
+    pub fn play(&self, m: &Move) -> Option<Position> {
+        self.inner.clone().play(*m).ok().map(|inner| Self { inner })
+    }
+
+    /// Access the underlying `shakmaty` position.
     pub fn inner(&self) -> &Chess {
         &self.inner
     }
