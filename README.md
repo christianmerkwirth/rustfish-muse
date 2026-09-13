@@ -3,10 +3,11 @@
 A UCI-compatible chess engine in Rust. The goal: beat Stockfish 18 limited to
 `UCI_Elo=2400`.
 
-Status: v0.3 — selective search (transposition table, null move, LMR,
-futility, repetition) on top of the v0.2 engine. Strength work follows the
-[roadmap](docs/ROADMAP.md); every step is gated by measurement
-([guide](docs/MEASUREMENT.md), [baseline](docs/BASELINE.md)).
+Status: v0.4 — positional eval (mobility, king safety, pawn structure,
+bishop pair, rook files, tempo), aspiration windows, and a stale-PV fix on top
+of the v0.3 engine: ≈SF 1800 level (even vs 1800 over 100 games, 44% vs 2000).
+Strength work follows the [roadmap](docs/ROADMAP.md); every step is gated by
+measurement ([guide](docs/MEASUREMENT.md), [baseline](docs/BASELINE.md)).
 
 ## Quickstart
 

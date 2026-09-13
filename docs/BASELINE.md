@@ -136,3 +136,60 @@ king safety, pawn structure, tuned values) attacks exactly that ceiling.
 `tools/results/match_20260913T195509Z.json` (1600, +10−10),
 `tools/results/match_20260913T195608Z.json` (1800, +9=1−10),
 `tools/results/selfplay_v03_v02.pgn` + `_b.pgn` (A/B, 49.5%).
+
+---
+
+# v0.4 evaluation depth (this milestone)
+
+Engine: v0.3 + full positional eval (mobility, king safety with pawn
+shelter/storm/open files/zone attackers, isolated/doubled/passed pawns,
+bishop pair, rook on open/semi-open files, tempo; all tapered mg/eg),
+aspiration windows (±25 from depth 5 with full-window research), and a
+stale-PV fix (TT-cutoff early returns left old tails in the triangular table;
+`pv_len` now resets on every node entry).
+
+## Correctness
+
+- `cargo test`: **67/67 pass** (adds one eval test per term — tempo exactness,
+  isolated/doubled/passed, pair, rook file, shelter, knight centralisation —
+  plus mate-through-aspiration and legal-PV-lines); clippy `-D warnings`
+  clean, fmt clean
+- UCI compliance CLI: **60/60**, pytest **15/15** (unchanged suite, green)
+- Perft unchanged (no movegen changes)
+
+## Speed and tactics (`bench.py`, release)
+
+- 1180 pos/s at `go depth 1`; startpos depth 10 at **2.0M nps** (v0.3: 2.6M —
+  the richer eval costs ~23%; aspiration recovers some time-to-depth)
+- mate_in_1: **20/20**; mate_in_2: **10/10**
+
+## Matches (release build, 10+0.1, 12-line book, SF 18)
+
+- vs `UCI_Elo=1600`, 100 games: **+52 =2 −46 (53%)**, +20.9±67.5, LOS 73%
+- vs `UCI_Elo=1800`, 100 games: **+48 =3 −49 (49.5%)**, −3.5±67.1
+- vs `UCI_Elo=2000`, 60 games: **+23 =7 −30 (44%)**, −40.7±83.1, LOS 17%
+- Head-to-head v0.4 vs v0.3, 100 games: **+28 =34 −38 (45%)**, −34.9±55.5
+  (same-style self-play compresses eval gains; both sides see the same truths)
+- Bug found by match play: `info` PVs occasionally carried illegal tails
+  (e.g. a reply ignoring a giving check, a pawn pushing backwards) — 2 cases
+  in 258 probed game positions. Root cause above; post-fix probe is 0/258 and
+  the longest PVs truncate instead of lying. No illegal *moves* anywhere.
+
+## Honest gate read
+
+Missed. The roadmap asked to *beat* 2000 (LOS > 99%); we score 44% against
+it. Placed overall at **≈SF 1800, roughly +20 over v0.3** — the eval terms are
+real but small at bullet, and single-thread node volume is now the binding
+constraint (2.0M nps, one thread). SPSA-style tuning was deferred (needs
+volume we cannot yet generate); hand-set standard values validated by the
+ladder instead. SMP moves up to v0.5: 16 threads at this TC should be worth
+~+100–150, the biggest single lever left before NNUE.
+
+## Raw artifacts (v0.4, gitignored; rerun to reproduce)
+
+`tools/results/bench_20260913T202443Z.json`,
+`tools/results/match_20260913T202716Z.json` + `.pgn` (1600, 20-game read),
+`tools/results/match_20260913T204316Z.json` + `.pgn` (1600, 100 games),
+`tools/results/match_20260913T204836Z.json` + `.pgn` (1800, 100 games),
+`tools/results/match_20260913T205340Z.json` + `.pgn` (2000, 60 games),
+`tools/results/selfplay_v04_v03.pgn` (A/B, 45%).

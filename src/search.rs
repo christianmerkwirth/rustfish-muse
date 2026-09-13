@@ -240,6 +240,11 @@ fn has_non_pawn_material(pos: &Position) -> bool {
         > 0
 }
 
+/// First aspiration window half-width, widened only by full-window research.
+pub const ASPIRATION_DELTA: i32 = 25;
+/// Deepening depth from which the previous score seeds an aspiration window.
+pub const ASPIRATION_MIN_DEPTH: u32 = 5;
+
 struct Search<'a> {
     control: &'a Control,
     emit: &'a dyn Fn(&str),
@@ -248,6 +253,7 @@ struct Search<'a> {
     stack: Vec<u64>,
     nodes: u64,
     seldepth: u32,
+    aspiration_fails: u64,
     deadline: Option<Instant>,
     node_limit: Option<u64>,
     max_depth: u32,
@@ -331,7 +337,7 @@ impl<'a> Search<'a> {
     }
 
     fn evaluate_stm(&self, pos: &Position) -> i32 {
-        let white_pov = eval::evaluate(pos.board());
+        let white_pov = eval::evaluate(pos.board(), pos.turn());
         match pos.turn() {
             Color::White => white_pov,
             Color::Black => -white_pov,
@@ -433,6 +439,10 @@ impl<'a> Search<'a> {
     ) -> i32 {
         self.nodes += 1;
         self.poll();
+        // Truncate this ply's PV line up front: every early return below
+        // (TT cutoff, pruning, repetition, stop) must leave an empty tail,
+        // or parents copy a stale line from an older branch into their PV.
+        self.pv_len[ply] = ply;
         if self.stopped || ply >= MAX_PLY {
             return alpha;
         }
@@ -560,7 +570,6 @@ impl<'a> Search<'a> {
         self.sort_moves(&mut moves, pos, ordered, ply);
 
         let alpha_orig = alpha;
-        self.pv_len[ply] = ply;
         let mut best = -INF;
         let mut best_move: Option<Move> = None;
         let mut idx = 0;
@@ -752,6 +761,7 @@ pub fn search(
         stack: Vec::with_capacity(64),
         nodes: 0,
         seldepth: 0,
+        aspiration_fails: 0,
         deadline: None,
         node_limit: limits.nodes,
         max_depth,
@@ -796,6 +806,16 @@ pub fn search(
         }
 
         let mut alpha = -INF;
+        // Aspiration: when the previous iteration completed, its score seeds
+        // a narrow window for the first root move; a fail low/high falls
+        // back to a full-window research below.
+        let mut beta_root = INF;
+        let mut aspiring = false;
+        if depth >= ASPIRATION_MIN_DEPTH && completed_depth + 1 == depth {
+            alpha = score - ASPIRATION_DELTA;
+            beta_root = score + ASPIRATION_DELTA;
+            aspiring = true;
+        }
         let mut best_this: Option<Move> = None;
         let mut score_this = -INF;
         // Principal variation for this iteration: best root move followed by
@@ -816,12 +836,24 @@ pub fn search(
             // Principal-variation search at the root: full window first,
             // null windows with full-window research afterwards.
             let mut s = if idx == 0 {
-                -searcher.negamax(&next, depth as i32 - 1, 1, -INF, -alpha, None, true)
+                -searcher.negamax(&next, depth as i32 - 1, 1, -beta_root, -alpha, None, true)
             } else {
                 -searcher.negamax(&next, depth as i32 - 1, 1, -alpha - 1, -alpha, None, true)
             };
             if searcher.stopped {
                 break;
+            }
+            if idx == 0 && aspiring && (s <= alpha || s >= beta_root) {
+                // Aspiration window failed: reset to the full window and get
+                // the exact score, so later siblings search valid bounds.
+                searcher.aspiration_fails += 1;
+                alpha = -INF;
+                beta_root = INF;
+                aspiring = false;
+                s = -searcher.negamax(&next, depth as i32 - 1, 1, -INF, INF, None, true);
+                if searcher.stopped {
+                    break;
+                }
             }
             // Root beta is +INF, so any improvement over alpha needs the
             // exact full-window score.
@@ -1028,6 +1060,25 @@ mod tests {
     }
 
     #[test]
+    fn search_keeps_mate_through_aspiration_windows() {
+        // Depth 8 runs several aspiration iterations (from depth 5) with
+        // mate scores inside narrow windows; fail low/high research must
+        // still return the forced mate, deterministically.
+        let pos = Position::from_fen("1r1k4/pp2n1p1/2p3B1/4Q3/1q3P2/N4RP1/1PPPr3/2RK4 b - - 8 23")
+            .unwrap();
+        let (first, _) = run_search(&pos, &["depth", "8"]);
+        let (second, _) = run_search(&pos, &["depth", "8"]);
+        assert!(
+            mates_with(&pos, &first.bestmove),
+            "bestmove {} does not mate",
+            first.bestmove
+        );
+        assert!(first.score.abs() >= MATE - 1000);
+        assert_eq!(first.bestmove, second.bestmove);
+        assert_eq!(first.score, second.score);
+    }
+
+    #[test]
     fn search_still_finds_mate_in_2_with_pruning() {
         // Pruning (null move, futility, LMR) must not hide forced mates.
         // Verified mate-in-2 positions from the bench suite.
@@ -1155,6 +1206,37 @@ mod tests {
             "missing depth-2 info: {lines:?}"
         );
         assert!(lines.iter().all(|l| l.contains(" pv ")), "{lines:?}");
+    }
+
+    #[test]
+    fn search_reports_legal_pv_lines() {
+        // Every info PV must be playable move by move: stale triangular-table
+        // entries (e.g. after a transposition-table cutoff) once leaked
+        // illegal moves into the PV and ponder fields.
+        for fen in [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
+            "r1bq1rk1/pp1pppbp/2n2np1/2p5/2B1P3/2NP1N2/PPP2PPP/R1BQ1RK1 w - - 0 8",
+        ] {
+            let pos = Position::from_fen(fen).unwrap();
+            let (_, lines) = run_search(&pos, &["depth", "8"]);
+            assert!(!lines.is_empty(), "no info lines for {fen}");
+            for line in &lines {
+                let Some(pv) = line.split_once(" pv ").map(|(_, pv)| pv) else {
+                    continue;
+                };
+                let mut check = pos.clone();
+                for token in pv.split_whitespace() {
+                    let uci: shakmaty::uci::UciMove = token.parse().unwrap();
+                    let m = uci.to_move(check.inner()).expect("legal PV move");
+                    assert!(
+                        check.legal_moves().contains(&m),
+                        "illegal PV move {token} in '{line}' ({fen})"
+                    );
+                    check = check.play(&m).unwrap();
+                }
+            }
+        }
     }
 
     #[test]
