@@ -11,6 +11,8 @@
 //! search arrives with iterative deepening; the command surface stays the same.
 
 use std::io::{BufRead, Write};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use crate::position::Position;
 use crate::search::{self, GoLimits};
@@ -176,17 +178,17 @@ fn uci_id_block(info: &EngineInfo) -> Vec<String> {
 fn apply_option(state: &mut EngineState, opt: &SetOption) {
     match opt.name.to_ascii_lowercase().as_str() {
         "hash" => {
-            if let Some(v) = opt.value.as_deref() {
-                if let Ok(mb) = v.trim().parse::<u32>() {
-                    state.hash_mb = mb.clamp(1, 1024);
-                }
+            if let Some(v) = opt.value.as_deref()
+                && let Ok(mb) = v.trim().parse::<u32>()
+            {
+                state.hash_mb = mb.clamp(1, 1024);
             }
         }
         "threads" => {
-            if let Some(v) = opt.value.as_deref() {
-                if let Ok(t) = v.trim().parse::<u32>() {
-                    state.threads = t.clamp(1, 512);
-                }
+            if let Some(v) = opt.value.as_deref()
+                && let Ok(t) = v.trim().parse::<u32>()
+            {
+                state.threads = t.clamp(1, 512);
             }
         }
         "ponder" => {
@@ -201,31 +203,81 @@ fn apply_option(state: &mut EngineState, opt: &SetOption) {
     }
 }
 
-fn report_search<W: Write>(out: &mut W, state: &EngineState, limits: &GoLimits) {
-    let result = search::search(&state.pos, limits);
-    // Minimal but valid info line: depth, nodes, score, pv.
-    let _ = writeln!(
-        out,
-        "info depth {} seldepth {} nodes {} nps {} time {} score cp 0 pv {}",
-        result.depth,
-        result.depth,
-        result.nodes,
-        1,
-        result.elapsed.as_millis(),
-        result.bestmove
-    );
-    let _ = writeln!(out, "bestmove {}", result.bestmove);
-    let _ = out.flush();
+/// Write one protocol line, tolerating a poisoned mutex (a panicked search
+/// thread must not take the command loop down with it).
+fn emit<W: Write>(out: &Mutex<W>, line: &str) {
+    let mut guard = out.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = writeln!(guard, "{line}");
+    let _ = guard.flush();
+}
+
+/// A running background search.
+struct ActiveSearch {
+    handle: thread::JoinHandle<()>,
+    control: Arc<search::Control>,
+}
+
+/// Launch a search thread. It owns all `info`/`bestmove` output for the
+/// search and prints exactly one `bestmove` line when it ends, whether it
+/// finishes, hits a limit, or is stopped.
+fn spawn_search<W: Write + Send + 'static>(
+    out: &Arc<Mutex<W>>,
+    pos: &Position,
+    limits: GoLimits,
+) -> ActiveSearch {
+    let control = Arc::new(search::Control::new());
+    let worker_control = Arc::clone(&control);
+    let worker_out = Arc::clone(out);
+    let worker_pos = pos.clone();
+    let handle = thread::spawn(move || {
+        let result = search::search(&worker_pos, &limits, &worker_control, &|line| {
+            emit(&worker_out, line);
+        });
+        match result.ponder {
+            Some(ponder) => emit(
+                &worker_out,
+                &format!("bestmove {} ponder {ponder}", result.bestmove),
+            ),
+            None => emit(&worker_out, &format!("bestmove {}", result.bestmove)),
+        }
+    });
+    ActiveSearch { handle, control }
+}
+
+/// Join a finished search thread. On panic (the only path where the worker
+/// could not print), fall back to a null `bestmove` so the GUI never hangs.
+fn reap<W: Write>(active: &mut Option<ActiveSearch>, out: &Arc<Mutex<W>>) {
+    if let Some(search) = active
+        && search.handle.is_finished()
+    {
+        let search = active.take().expect("active search");
+        if search.handle.join().is_err() {
+            emit(out, "info string search thread failed");
+            emit(out, "bestmove 0000");
+        }
+    }
+}
+
+/// Stop a running search and wait for its `bestmove`.
+fn stop_search<W: Write>(active: &mut Option<ActiveSearch>, out: &Arc<Mutex<W>>) {
+    if let Some(search) = active.take() {
+        search
+            .control
+            .stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if search.handle.join().is_err() {
+            emit(out, "info string search thread failed");
+            emit(out, "bestmove 0000");
+        }
+    }
 }
 
 /// Run the command loop until `quit` or end of input. Exposed for tests with
-/// in-memory buffers.
-pub fn run_loop<R: BufRead, W: Write>(input: R, output: W, info: EngineInfo) {
-    let mut out = output;
+/// in-memory buffers. Returns the writer so tests can inspect the output.
+pub fn run_loop<R: BufRead, W: Write + Send + 'static>(input: R, output: W, info: EngineInfo) -> W {
+    let out = Arc::new(Mutex::new(output));
     let mut state = EngineState::default();
-    // Pending unbounded search (`go infinite` / `go ponder`): we stay in the
-    // wait state until stop/quit.
-    let mut pending: Option<GoLimits> = None;
+    let mut active: Option<ActiveSearch> = None;
 
     for line in input.lines() {
         let line = match line {
@@ -241,22 +293,38 @@ pub fn run_loop<R: BufRead, W: Write>(input: R, output: W, info: EngineInfo) {
             None => (cmd, ""),
         };
 
-        if pending.is_some() {
-            // While an unbounded search runs, only a subset of commands is
-            // meaningful; everything else is ignored until `stop`.
+        // Commands that act on a running search take effect immediately.
+        match keyword {
+            "stop" => {
+                stop_search(&mut active, &out);
+                continue;
+            }
+            "quit" => {
+                stop_search(&mut active, &out);
+                break;
+            }
+            "ponderhit" => {
+                if let Some(search) = active.as_ref() {
+                    search
+                        .control
+                        .ponderhit
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                continue;
+            }
+            _ => {}
+        }
+
+        // Reap a finished worker first: a `position`/`go` arriving right after
+        // our `bestmove` must be processed normally, never dropped. (Dropping
+        // it desynchronises the board and the next `bestmove` is illegal in
+        // the real game.)
+        reap(&mut active, &out);
+
+        if active.is_some() {
+            // A search is still running: only sync commands get answers.
             match keyword {
-                "stop" => {
-                    let limits = pending.take().expect("pending search");
-                    report_search(&mut out, &state, &limits);
-                }
-                "isready" => {
-                    let _ = writeln!(out, "readyok");
-                    let _ = out.flush();
-                }
-                "ponderhit" => {
-                    // The ponder move was played; keep waiting for `stop`.
-                }
-                "quit" => break,
+                "isready" => emit(&out, "readyok"),
                 "debug" => {
                     state.debug = matches!(args.to_ascii_lowercase().as_str(), "on");
                 }
@@ -268,16 +336,14 @@ pub fn run_loop<R: BufRead, W: Write>(input: R, output: W, info: EngineInfo) {
         match keyword {
             "uci" => {
                 for line in uci_id_block(&info) {
-                    let _ = writeln!(out, "{line}");
+                    emit(&out, &line);
                 }
-                let _ = out.flush();
             }
             "debug" => {
                 state.debug = matches!(args.to_ascii_lowercase().as_str(), "on");
             }
             "isready" => {
-                let _ = writeln!(out, "readyok");
-                let _ = out.flush();
+                emit(&out, "readyok");
             }
             "setoption" => {
                 if let Some(opt) = parse_setoption(args) {
@@ -294,7 +360,7 @@ pub fn run_loop<R: BufRead, W: Write>(input: R, output: W, info: EngineInfo) {
                             Ok(p) => p,
                             Err(e) => {
                                 if state.debug {
-                                    let _ = writeln!(out, "info string position error: {e}");
+                                    emit(&out, &format!("info string position error: {e}"));
                                 }
                                 continue;
                             }
@@ -303,7 +369,7 @@ pub fn run_loop<R: BufRead, W: Write>(input: R, output: W, info: EngineInfo) {
                     };
                     if let Err(e) = next.apply_uci_moves(&parsed.moves) {
                         if state.debug {
-                            let _ = writeln!(out, "info string position error: {e}");
+                            emit(&out, &format!("info string position error: {e}"));
                         }
                         continue;
                     }
@@ -311,17 +377,13 @@ pub fn run_loop<R: BufRead, W: Write>(input: R, output: W, info: EngineInfo) {
                 }
                 None => {
                     if state.debug {
-                        let _ = writeln!(out, "info string position error: malformed command");
+                        emit(&out, "info string position error: malformed command");
                     }
                 }
             },
             "go" => {
                 let limits = search::parse_go(&args.split_whitespace().collect::<Vec<_>>());
-                if limits.is_unbounded() {
-                    pending = Some(limits);
-                } else {
-                    report_search(&mut out, &state, &limits);
-                }
+                active = Some(spawn_search(&out, &state.pos, limits));
             }
             "stop" => {
                 // No search running: nothing to do.
@@ -335,7 +397,12 @@ pub fn run_loop<R: BufRead, W: Write>(input: R, output: W, info: EngineInfo) {
             }
         }
     }
-    let _ = out.flush();
+    stop_search(&mut active, &out);
+    // All worker threads are joined, so this is the last Arc.
+    Arc::try_unwrap(out)
+        .unwrap_or_else(|_| panic!("output still shared"))
+        .into_inner()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]
@@ -352,8 +419,7 @@ mod tests {
     }
 
     fn drive(input: &str) -> String {
-        let mut output = Vec::new();
-        run_loop(Cursor::new(input.as_bytes()), &mut output, test_info());
+        let output = run_loop(Cursor::new(input.as_bytes()), Vec::new(), test_info());
         String::from_utf8(output).unwrap()
     }
 
@@ -437,18 +503,66 @@ mod tests {
         assert!(out.contains("readyok"));
     }
 
+    fn search_at_depth(pos: &Position, depth: u64) -> String {
+        let limits = search::parse_go(&["depth", &depth.to_string()]);
+        search::search(pos, &limits, &search::Control::new(), &|_| {}).bestmove
+    }
+
     #[test]
     fn ucinewgame_resets_position() {
-        let out =
-            drive("position startpos moves e2e4 e7e5\ng o depth 1\nucinewgame\ngo depth 1\nquit\n");
-        // The second bestmove comes from the fresh startpos.
-        let expected = search::search(&Position::startpos(), &GoLimits::default()).bestmove;
+        // One search only: a second `go` while the first runs is ignored, so
+        // reset first, then search from the fresh startpos.
+        let out = drive("position startpos moves e2e4 e7e5\nucinewgame\ngo depth 1\nquit\n");
+        let expected = search_at_depth(&Position::startpos(), 1);
         let last = out
             .lines()
             .filter_map(|l| l.strip_prefix("bestmove "))
             .next_back()
             .unwrap();
         assert_eq!(last.split_whitespace().next().unwrap(), expected);
+    }
+
+    #[test]
+    fn go_depth_emits_info_lines() {
+        // The trailing `quit` may cut deepening short, but iteration 1 always
+        // completes and reports before the worker can observe the stop.
+        let out = drive("position startpos\ngo depth 2\nquit\n");
+        assert!(out.contains("info depth 1"), "got:\n{out}");
+        assert!(out.contains("score"), "got:\n{out}");
+        assert!(out.contains(" pv "), "got:\n{out}");
+        assert!(bestmove_of(&out).is_some());
+    }
+
+    #[test]
+    fn isready_answered_during_search() {
+        let out = drive("position startpos\ngo infinite\nisready\nstop\nquit\n");
+        assert!(out.contains("readyok"), "got:\n{out}");
+        assert!(bestmove_of(&out).is_some(), "got:\n{out}");
+    }
+
+    #[test]
+    fn quit_during_search_exits() {
+        // Must return (join the worker) rather than hang.
+        let out = drive("position startpos\ngo infinite\nquit\n");
+        let _ = out;
+    }
+
+    #[test]
+    fn sequential_searches_each_see_their_position() {
+        // `stop` fully joins the worker, so the next `position`+`go` pair
+        // must be searched from the new board, not the old one.
+        let out = drive(
+            "position startpos\ngo depth 1\nstop\nposition startpos moves e2e4\ngo depth 1\nquit\n",
+        );
+        let moves: Vec<&str> = out
+            .lines()
+            .filter_map(|l| l.strip_prefix("bestmove "))
+            .map(|rest| rest.split_whitespace().next().unwrap())
+            .collect();
+        assert_eq!(moves.len(), 2, "got:\n{out}");
+        let mut after_e4 = Position::startpos();
+        after_e4.apply_uci_moves(&["e2e4".to_string()]).unwrap();
+        assert_eq!(moves[1], search_at_depth(&after_e4, 1));
     }
 
     #[test]
@@ -465,7 +579,7 @@ mod tests {
         // answer from the previous (startpos) position.
         let out = drive("position startpos moves e2e5\ngo depth 1\nquit\n");
         let bm = bestmove_of(&out).expect("engine died on bad position");
-        let expected = search::search(&Position::startpos(), &GoLimits::default()).bestmove;
+        let expected = search_at_depth(&Position::startpos(), 1);
         assert_eq!(bm, expected);
     }
 

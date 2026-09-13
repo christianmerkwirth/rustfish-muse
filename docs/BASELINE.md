@@ -33,4 +33,55 @@ Stockfish: version 18, `UCI_LimitStrength` + `UCI_Elo`, Hash=32 Threads=1.
 ## Raw artifacts
 
 `tools/results/bench_20260913T185443Z.json`,
-`tools/results/match_20260913T185555Z.json` (gitignored; rerun to reproduce).
+`tools/results/match_20260913T185555Z.json` (4-game smoke),
+`tools/results/match_20260913T185902Z.json` (10-game calibration)
+(gitignored; rerun to reproduce).
+
+---
+
+# v0.2 real search (this milestone, numbers filling in)
+
+Engine: negamax alpha-beta, iterative deepening, capture quiescence with
+check evasions, PV/MVV-LVA/killer/history ordering, tapered PST eval.
+Matches play the release build; protocol tests use either build.
+
+## Correctness
+
+- `cargo test`: **45/45 pass** (adds perft startpos 1–4 + kiwipete 1–3,
+  mate-in-1 finding, info-per-iteration, movetime respect, determinism,
+  sequential-position regression); clippy `-D warnings` clean, fmt clean
+- UCI compliance CLI: **60/60 pass** (adds `sequential_searches`: back-to-back
+  searches on one engine must each see their own board — this check fails on
+  the pre-fix loop, which dropped `position` commands arriving right after
+  `bestmove` and played illegal stale moves in real games); pytest: 15/15
+- Tactical suites re-verified (unchanged data)
+
+## Speed and tactics (`bench.py`)
+
+- Debug: 199 positions, handshake 0.43 ms, mean 4.17 ms/pos, p95 7.90 ms/pos,
+  239.9 pos/s at `go depth 1`
+- Release: handshake 0.31 ms, mean 0.79 ms/pos, p95 3.07 ms/pos, 1269.5 pos/s
+- mate_in_1: **20/20 (100%)**; mate_in_2: **7/10 (70%)** at 200 ms/position
+  (same on both builds) — clears the "mate-in-1 mostly solved" gate
+
+## Matches vs Stockfish (release build, 10+0.1)
+
+- Framework bug found by the gate match: the command loop dropped `position`
+  commands arriving after a finished-but-unreaped search, so the engine
+  replayed stale moves (0–50 with illegal-move forfeits). Fixed in this
+  milestone, regression-tested both directions (new check fails pre-fix with
+  a repeated stale move, passes post-fix), rerun below.
+- Calibration vs Stockfish `UCI_Elo=1320`, 100 games (2×25 pairs, 12-line
+  book, resign/draw adjudication): **+61 =0 −39 (61%)**, Elo **+77.7±69.8**,
+  LOS **98.8%**, zero illegal-move terminations.
+- Honest gate read: the roadmap asked >65% over 50 pairs for "clearly beats
+  1320". At 61% the score line is narrowly missed, but +78 Elo with LOS 99%
+  (from 0–10 in v0.1) shows a real engine that outplays the weakest anchor.
+  v0.3 (transposition table, null move, LMR) must clear the bar outright.
+
+## Raw artifacts (v0.2)
+
+`tools/results/bench_20260913T191959Z.json` (debug),
+`tools/results/bench_20260913T193536Z.json` (release),
+`tools/results/match_20260913T192511Z.json` + `.pgn` (leg 1, +32−18),
+`tools/results/match_20260913T193056Z.json` + `.pgn` (leg 2, +29−21).

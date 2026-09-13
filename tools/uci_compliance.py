@@ -433,6 +433,30 @@ class Suite:
         )
         return all_ok
 
+    def check_sequential_searches(self) -> bool:
+        # Regression test: a `position` arriving right after our `bestmove`
+        # (worker finished but unreaped) must update the board. Uses one
+        # engine for two back-to-back searches; the second answer must be
+        # legal in the second position.
+        eng = self.fresh()
+        try:
+            eng.send("position startpos")
+            eng.send("go depth 3")
+            first, _ = eng.wait_bestmove(self.timeout)
+            eng.send("position startpos moves e2e4")
+            eng.send("go depth 3")
+            second, _ = eng.wait_bestmove(self.timeout)
+            board = chess.Board()
+            board.push_uci("e2e4")
+            ok = chess.Move.from_uci(second) in board.legal_moves
+            return self.record(
+                "sequential_searches", ok, f"first={first} second={second}"
+            )
+        except (EngineError, ValueError) as e:
+            return self.record("sequential_searches", False, str(e))
+        finally:
+            eng.quit()
+
     def check_quit(self) -> bool:
         eng = self.fresh()
         try:
@@ -457,6 +481,7 @@ class Suite:
         self.check_bad_input()
         self.check_infinite_then_stop()
         self.check_ponder()
+        self.check_sequential_searches()
         self.check_fuzz_random_positions()
         self.check_quit()
         return self.results
@@ -516,6 +541,7 @@ def pytest_generate_tests(metafunc):
             "bad_input",
             "infinite_stop",
             "ponder",
+            "sequential",
             "fuzz",
             "quit",
         ]
@@ -542,6 +568,7 @@ def test_uci_compliance(check_name, pytestconfig):
         "bad_input": suite.check_bad_input,
         "infinite_stop": suite.check_infinite_then_stop,
         "ponder": suite.check_ponder,
+        "sequential": suite.check_sequential_searches,
         "fuzz": suite.check_fuzz_random_positions,
         "quit": suite.check_quit,
     }[check_name]

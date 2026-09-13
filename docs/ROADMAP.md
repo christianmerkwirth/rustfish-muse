@@ -14,8 +14,10 @@ pipeline with Elo stats. Baseline: loses 0–4 to Stockfish at Elo 1320,
 
 - Negamax alpha-beta with iterative deepening and a background search thread
   (true `stop` handling, `info depth/score/nps` output)
-- Move ordering: hash move, MVV-LVA captures, killers, history
-- Quiescence search (captures), basic time management (clock + movetime)
+- Move ordering: PV move, MVV-LVA captures, killers, history (hash move
+  arrives with the transposition table in v0.3)
+- Quiescence search (captures, check evasions), basic time management
+  (clock + movetime + depth/nodes/mate)
 - Evaluation: material + piece-square tables, game-phase taper
 
 Gate: beats Stockfish Elo 1320 clearly (>65% over 50 pairs); mate-in-1

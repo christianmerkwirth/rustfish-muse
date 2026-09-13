@@ -1,7 +1,7 @@
 [package]
 name = "rustfish"
-version = "0.1.0"
-edition = "2021"
+version = "0.2.0"
+edition = "2024"
 description = "A UCI compatible chess engine in Rust"
 license = "MIT OR Apache-2.0"
 
