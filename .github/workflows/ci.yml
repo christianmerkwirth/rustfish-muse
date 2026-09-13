@@ -20,6 +20,8 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Unit tests
         run: cargo test
+      - name: Build engine binary
+        run: cargo build
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
