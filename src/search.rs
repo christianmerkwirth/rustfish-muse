@@ -1,10 +1,11 @@
-//! Negamax alpha-beta search with iterative deepening and quiescence.
+//! Negamax alpha-beta search with iterative deepening, quiescence and
+//! selective pruning.
 //!
-//! v0.2 strength: tapered piece-square evaluation, MVV-LVA capture ordering
-//! plus killers/history/PV-move, capture quiescence with check evasions,
-//! and clock/movetime/depth/nodes/mate limits. Single-threaded and fully
-//! deterministic for fixed depth limits; time-managed searches may complete
-//! different depths run to run.
+//! v0.3 strength: everything from v0.2 plus a transposition table (with mate
+//! adjustment), null-move pruning, late-move reductions with PVS re-search,
+//! reverse futility, razoring, check extensions and repetition detection.
+//! Single-threaded and fully deterministic for fixed depth limits;
+//! time-managed searches may complete different depths run to run.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -13,6 +14,7 @@ use shakmaty::{CastlingMode, Color, Move, Position as _, Role};
 
 use crate::eval;
 use crate::position::Position;
+use crate::tt::{Bound, Table};
 
 /// Score of a forced mate, minus plies to mate. `INF` bounds all scores.
 pub const MATE: i32 = 100_000;
@@ -214,9 +216,36 @@ fn order_score(m: &Move, turn: Color, board: &shakmaty::Board) -> i32 {
     score
 }
 
+/// True when `key` already occurred twice on the path (game history plus the
+/// search stack): the current position completes a threefold repetition, so
+/// the search scores it a draw without descending further.
+fn is_repetition(game_keys: &[u64], stack: &[u64], key: u64) -> bool {
+    let mut seen = 0;
+    for k in game_keys.iter().chain(stack.iter()) {
+        if *k == key {
+            seen += 1;
+            if seen >= 2 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Null-move pruning is unsound in zugzwang-prone positions, so it requires
+/// a non-pawn piece on the board for the side to move.
+fn has_non_pawn_material(pos: &Position) -> bool {
+    let material = pos.board().material_side(pos.turn());
+    material[Role::Knight] + material[Role::Bishop] + material[Role::Rook] + material[Role::Queen]
+        > 0
+}
+
 struct Search<'a> {
     control: &'a Control,
     emit: &'a dyn Fn(&str),
+    tt: &'a mut Table,
+    game_keys: &'a [u64],
+    stack: Vec<u64>,
     nodes: u64,
     seldepth: u32,
     deadline: Option<Instant>,
@@ -317,10 +346,29 @@ impl<'a> Search<'a> {
         }
         self.seldepth = self.seldepth.max(ply as u32);
 
+        let key = pos.key();
+        if let Some(hit) = self.tt.probe(key, ply) {
+            match hit.bound {
+                Bound::Exact => return hit.score,
+                Bound::Lower => {
+                    if hit.score >= beta {
+                        return hit.score;
+                    }
+                }
+                Bound::Upper => {
+                    if hit.score <= alpha {
+                        return hit.score;
+                    }
+                }
+            }
+        }
+
+        let alpha_orig = alpha;
         let in_check = pos.is_check();
         if !in_check {
             let stand_pat = self.evaluate_stm(pos);
             if stand_pat >= beta {
+                self.tt.store(key, None, beta, 0, Bound::Lower, ply);
                 return beta;
             }
             if stand_pat > alpha {
@@ -353,25 +401,60 @@ impl<'a> Search<'a> {
                 }
             }
         }
+        if !self.stopped {
+            let bound = if alpha <= alpha_orig {
+                Bound::Upper
+            } else if alpha >= beta {
+                Bound::Lower
+            } else {
+                Bound::Exact
+            };
+            self.tt.store(key, None, alpha, 0, bound, ply);
+        }
         alpha
     }
 
+    /// Full-width search with repetition detection. The stack push/pop lives
+    /// here so every early return in the search body stays balanced.
+    /// Eight parameters is the standard negamax shape (position, depth, ply,
+    /// window, PV move, null-move rights); bundling them would obscure it.
+    #[allow(clippy::too_many_arguments)]
     fn negamax(
         &mut self,
         pos: &Position,
         depth: i32,
         ply: usize,
-        mut alpha: i32,
+        alpha: i32,
         beta: i32,
         pv_move: Option<&Move>,
+        can_null: bool,
     ) -> i32 {
         self.nodes += 1;
         self.poll();
         if self.stopped || ply >= MAX_PLY {
             return alpha;
         }
-        self.seldepth = self.seldepth.max(ply as u32);
+        if is_repetition(self.game_keys, &self.stack, pos.key()) {
+            return 0;
+        }
+        self.stack.push(pos.key());
+        let score = self.negamax_search(pos, depth, ply, alpha, beta, pv_move, can_null);
+        self.stack.pop();
+        score
+    }
 
+    /// Same standard shape as [`Search::negamax`]; see there for the allow.
+    #[allow(clippy::too_many_arguments)]
+    fn negamax_search(
+        &mut self,
+        pos: &Position,
+        mut depth: i32,
+        ply: usize,
+        mut alpha: i32,
+        beta: i32,
+        pv_move: Option<&Move>,
+        can_null: bool,
+    ) -> i32 {
         if pos.is_game_over() || pos.halfmoves() >= 100 {
             return if pos.inner().is_checkmate() {
                 -MATE + ply as i32
@@ -382,23 +465,144 @@ impl<'a> Search<'a> {
         if depth <= 0 {
             return self.quiescence(pos, ply, alpha, beta);
         }
+        self.seldepth = self.seldepth.max(ply as u32);
+
+        let in_check = pos.is_check();
+        let key = pos.key();
+
+        // Transposition table probe; the stored move orders first.
+        let mut tt_move: Option<Move> = None;
+        if let Some(hit) = self.tt.probe(key, ply) {
+            tt_move = hit.best;
+            if hit.depth >= depth {
+                match hit.bound {
+                    Bound::Exact => return hit.score,
+                    Bound::Lower => {
+                        if hit.score >= beta {
+                            return hit.score;
+                        }
+                    }
+                    Bound::Upper => {
+                        if hit.score <= alpha {
+                            return hit.score;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Static eval feeds the pruning decisions. Skipped in check: the
+        // evasions play out in full.
+        let eval = if !in_check {
+            Some(self.evaluate_stm(pos))
+        } else {
+            None
+        };
+
+        // Reverse futility: clearly ahead with little depth left.
+        if let Some(e) = eval
+            && (1..=2).contains(&depth)
+            && beta < MATE - 1000
+            && e - 120 * depth >= beta
+        {
+            return e;
+        }
+
+        // Razoring: at the frontier, a bad eval drops straight to quiescence.
+        if let Some(e) = eval
+            && depth == 1
+            && alpha < MATE - 1000
+            && e + 250 <= alpha
+        {
+            return self.quiescence(pos, ply, alpha, beta);
+        }
+
+        // Null-move pruning: passing must not refute a beta cutoff.
+        if can_null
+            && depth >= 3
+            && !in_check
+            && beta < MATE - 1000
+            && let Some(e) = eval
+            && e >= beta
+            && has_non_pawn_material(pos)
+            && let Some(null_pos) = pos.null_move()
+        {
+            let reduction = if depth > 6 { 3 } else { 2 };
+            let score = -self.negamax(
+                &null_pos,
+                depth - 1 - reduction,
+                ply + 1,
+                -beta,
+                -beta + 1,
+                None,
+                false,
+            );
+            if self.stopped {
+                return 0;
+            }
+            if score >= beta {
+                return score;
+            }
+        }
+
+        // Check extension: see the forced reply one ply deeper.
+        if in_check {
+            depth += 1;
+        }
 
         let mut moves = pos.legal_moves();
         if moves.is_empty() {
-            return if pos.is_check() {
-                -MATE + ply as i32
-            } else {
-                0
-            };
+            return if in_check { -MATE + ply as i32 } else { 0 };
         }
-        self.sort_moves(&mut moves, pos, pv_move, ply);
+        let ordered = tt_move.as_ref().or(pv_move);
+        self.sort_moves(&mut moves, pos, ordered, ply);
 
+        let alpha_orig = alpha;
         self.pv_len[ply] = ply;
         let mut best = -INF;
         let mut best_move: Option<Move> = None;
+        let mut idx = 0;
         for m in &moves {
             let Some(next) = pos.play(m) else { continue };
-            let score = -self.negamax(&next, depth - 1, ply + 1, -beta, -alpha, None);
+            let quiet = !m.is_capture() && !m.is_promotion();
+            // Frontier futility: hopeless quiets at depth 1 (captures tried).
+            if idx > 0
+                && depth == 1
+                && !in_check
+                && quiet
+                && let Some(e) = eval
+                && e + 200 <= alpha
+            {
+                idx += 1;
+                continue;
+            }
+            let mut score;
+            if idx == 0 {
+                score = -self.negamax(&next, depth - 1, ply + 1, -beta, -alpha, None, true);
+            } else {
+                // Late-move reduction for quiet laggards, verified by research.
+                let reduction = if idx >= 3 && depth >= 3 && quiet && !in_check {
+                    1 + ((depth >= 7 && idx >= 12) as i32)
+                } else {
+                    0
+                };
+                score = -self.negamax(
+                    &next,
+                    depth - 1 - reduction,
+                    ply + 1,
+                    -alpha - 1,
+                    -alpha,
+                    None,
+                    true,
+                );
+                if score > alpha && reduction > 0 {
+                    score =
+                        -self.negamax(&next, depth - 1, ply + 1, -alpha - 1, -alpha, None, true);
+                }
+                if score > alpha && score < beta {
+                    score = -self.negamax(&next, depth - 1, ply + 1, -beta, -alpha, None, true);
+                }
+            }
             if self.stopped {
                 return 0;
             }
@@ -416,7 +620,7 @@ impl<'a> Search<'a> {
                     self.pv_len[ply] = child_len;
                     if alpha >= beta {
                         // Beta cutoff: killers + history for quiet moves.
-                        if !m.is_capture() && !m.is_promotion() {
+                        if quiet {
                             if self.killers[ply][0].as_ref() != Some(m) {
                                 self.killers[ply][1] = self.killers[ply][0];
                                 self.killers[ply][0] = Some(*m);
@@ -433,8 +637,18 @@ impl<'a> Search<'a> {
                     }
                 }
             }
+            idx += 1;
         }
-        let _ = best_move;
+        if !self.stopped {
+            let bound = if best <= alpha_orig {
+                Bound::Upper
+            } else if best >= beta {
+                Bound::Lower
+            } else {
+                Bound::Exact
+            };
+            self.tt.store(key, best_move, best, depth, bound, ply);
+        }
         best
     }
 }
@@ -472,10 +686,14 @@ fn format_score(score: i32) -> String {
 /// Emits `info ...` lines through `emit` as iterations complete. Returns the
 /// best move found; on early stop the best of the last completed iteration,
 /// falling back to the first legal move when nothing completed.
+///
+/// `tt` persists across calls (it is the engine's shared table) and gets a
+/// fresh generation per search; game history comes from the position.
 pub fn search(
     pos: &Position,
     limits: &GoLimits,
     control: &Control,
+    tt: &mut Table,
     emit: &dyn Fn(&str),
 ) -> CompletedSearch {
     let started = Instant::now();
@@ -521,9 +739,13 @@ pub fn search(
         max_depth = max_depth.min(mate_in as u32 * 2 + 1);
     }
 
+    tt.new_generation();
     let mut searcher = Search {
         control,
         emit,
+        tt,
+        game_keys: pos.history(),
+        stack: Vec::with_capacity(64),
         nodes: 0,
         seldepth: 0,
         deadline: None,
@@ -577,15 +799,31 @@ pub fn search(
         // overwrite the shared triangular table.
         let mut pv_this: Vec<Move> = Vec::new();
 
-        // Root split: previous best (PV) move first, rest ordered.
-        let pv_move = ordered.first().cloned();
+        // Root split: transposition-table move, then previous best, rest ordered.
+        let tt_root = searcher.tt.probe(pos.key(), 0).and_then(|hit| hit.best);
+        let pv_move = tt_root.or_else(|| ordered.first().copied());
         searcher.sort_moves(&mut ordered, pos, pv_move.as_ref(), 0);
 
+        let mut idx = 0;
         for m in &ordered {
             let Some(next) = pos.play(m) else { continue };
-            let s = -searcher.negamax(&next, depth as i32 - 1, 1, -INF, -alpha, None);
+            // Principal-variation search at the root: full window first,
+            // null windows with full-window research afterwards.
+            let mut s = if idx == 0 {
+                -searcher.negamax(&next, depth as i32 - 1, 1, -INF, -alpha, None, true)
+            } else {
+                -searcher.negamax(&next, depth as i32 - 1, 1, -alpha - 1, -alpha, None, true)
+            };
             if searcher.stopped {
                 break;
+            }
+            // Root beta is +INF, so any improvement over alpha needs the
+            // exact full-window score.
+            if idx > 0 && s > alpha {
+                s = -searcher.negamax(&next, depth as i32 - 1, 1, -INF, -alpha, None, true);
+                if searcher.stopped {
+                    break;
+                }
             }
             if s > score_this {
                 score_this = s;
@@ -599,6 +837,7 @@ pub fn search(
                     }
                 }
             }
+            idx += 1;
         }
         if searcher.stopped {
             break;
@@ -633,13 +872,19 @@ pub fn search(
             } else {
                 searcher.nodes
             };
+            // Persist the root so later searches (and deeper iterations via
+            // the TT move) start from knowledge.
+            searcher
+                .tt
+                .store(pos.key(), Some(bm), score, depth as i32, Bound::Exact, 0);
             (searcher.emit)(&format!(
-                "info depth {depth} seldepth {} time {} nodes {} nps {} score {} pv {}",
+                "info depth {depth} seldepth {} time {} nodes {} nps {} score {} hashfull {} pv {}",
                 searcher.seldepth,
                 elapsed.as_millis(),
                 searcher.nodes,
                 nps,
                 format_score(white_pov),
+                searcher.tt.hashfull(),
                 pv_line.join(" ")
             ));
         }
@@ -678,17 +923,30 @@ mod tests {
 
     fn silent(_: &str) {}
 
+    /// Run a search with a fresh 1 MB table, returning result and info lines.
+    fn run_search(pos: &Position, go: &[&str]) -> (CompletedSearch, Vec<String>) {
+        let limits = parse_go(go);
+        let mut tt = Table::new(1);
+        let lines: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let result = search(pos, &limits, &no_control(), &mut tt, &|line| {
+            lines.lock().unwrap().push(line.to_string());
+        });
+        (result, lines.lock().unwrap().clone())
+    }
+
     fn search_depth(fen: Option<&str>, depth: u64) -> CompletedSearch {
         let pos = match fen {
             Some(f) => Position::from_fen(f).unwrap(),
             None => Position::startpos(),
         };
-        search(
-            &pos,
-            &parse_go(&["depth", &depth.to_string()]),
-            &no_control(),
-            &silent,
-        )
+        run_search(&pos, &["depth", &depth.to_string()]).0
+    }
+
+    fn mates_with(pos: &Position, bestmove: &str) -> bool {
+        let bm: shakmaty::uci::UciMove = bestmove.parse().unwrap();
+        pos.play(&bm.to_move(pos.inner()).unwrap())
+            .map(|played| played.inner().is_checkmate())
+            .unwrap_or(false)
     }
 
     #[test]
@@ -754,16 +1012,49 @@ mod tests {
         // Verified mate-in-1 from the bench suite: black to play and mate.
         let pos = Position::from_fen("1r1k4/pp2n1p1/2p3B1/4Q3/1q3P2/N4RP1/1PPPr3/2RK4 b - - 8 23")
             .unwrap();
-        let result = search(&pos, &parse_go(&["depth", "3"]), &no_control(), &silent);
-        // The chosen move must deliver checkmate.
-        let bm: shakmaty::uci::UciMove = result.bestmove.parse().unwrap();
-        let played = pos.play(&bm.to_move(pos.inner()).unwrap()).unwrap();
+        let (result, _) = run_search(&pos, &["depth", "3"]);
         assert!(
-            played.inner().is_checkmate(),
+            mates_with(&pos, &result.bestmove),
             "bestmove {} does not mate",
             result.bestmove
         );
         assert!(result.score.abs() >= MATE - 1000);
+    }
+
+    #[test]
+    fn search_still_finds_mate_in_2_with_pruning() {
+        // Pruning (null move, futility, LMR) must not hide forced mates.
+        // Verified mate-in-2 positions from the bench suite.
+        for fen in [
+            "1n2kbnr/1p2p2P/8/r2p4/3P1Pb1/1PP5/7P/q1B1K3 b k - 0 21",
+            "1n2q1r1/rbpp1ppk/8/pBp1p1B1/4P1P1/N1P2P2/PP1KN1P1/R2Q4 w - - 2 16",
+        ] {
+            let pos = Position::from_fen(fen).unwrap();
+            let (result, _) = run_search(&pos, &["depth", "5"]);
+            let bm: shakmaty::uci::UciMove = result.bestmove.parse().unwrap();
+            let after = pos.play(&bm.to_move(pos.inner()).unwrap()).unwrap();
+            // Either mates at once, or every reply still allows mate on move.
+            let immediate = after.inner().is_checkmate();
+            let replies = after.legal_moves();
+            let forces = !replies.is_empty()
+                && replies.iter().all(|reply| {
+                    after
+                        .play(reply)
+                        .map(|p2| {
+                            p2.legal_moves().iter().any(|m2| {
+                                p2.play(m2)
+                                    .map(|p3| p3.inner().is_checkmate())
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .unwrap_or(false)
+                });
+            assert!(
+                immediate || forces,
+                "bestmove {} in {fen} does not force mate in 2",
+                result.bestmove
+            );
+        }
     }
 
     #[test]
@@ -777,12 +1068,7 @@ mod tests {
     #[test]
     fn search_honours_searchmoves() {
         let pos = Position::startpos();
-        let result = search(
-            &pos,
-            &parse_go(&["searchmoves", "g1f3", "e2e4", "depth", "2"]),
-            &no_control(),
-            &silent,
-        );
+        let (result, _) = run_search(&pos, &["searchmoves", "g1f3", "e2e4", "depth", "2"]);
         assert!(["g1f3", "e2e4"].contains(&result.bestmove.as_str()));
     }
 
@@ -790,19 +1076,70 @@ mod tests {
     fn search_reports_null_move_when_mated_or_stalemated() {
         let pos = Position::from_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1").unwrap();
         assert_eq!(pos.legal_move_count(), 0);
-        let result = search(&pos, &GoLimits::default(), &no_control(), &silent);
+        let mut tt = Table::new(1);
+        let result = search(&pos, &GoLimits::default(), &no_control(), &mut tt, &silent);
         assert_eq!(result.bestmove, "0000");
+    }
+
+    #[test]
+    fn repetition_detector_counts_path_occurrences() {
+        // Startpos history holds the key once (the game start itself).
+        let pos = Position::startpos();
+        let key = pos.key();
+        // Seen once before: twofold, not yet a draw.
+        assert!(!is_repetition(pos.history(), &[], key));
+        // Seen twice before (game + path return): threefold, draw.
+        assert!(is_repetition(pos.history(), &[key], key));
+        assert!(is_repetition(pos.history(), &[key, key], key));
+        assert!(!is_repetition(pos.history(), &[key], 0x1234_5678));
+    }
+
+    #[test]
+    fn search_handles_repeated_positions() {
+        // Knights out and back twice: the start repeats, and 5.Nf3 would
+        // repeat a third time, so that line must score a draw, not crash.
+        let mut pos = Position::startpos();
+        pos.apply_uci_moves(
+            &[
+                "g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1", "f6g8",
+            ]
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let (result, _) = run_search(&pos, &["depth", "3"]);
+        let legal: Vec<String> = pos
+            .legal_moves_sorted()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(legal.contains(&result.bestmove));
+    }
+
+    #[test]
+    fn shared_table_cuts_repeat_search_nodes() {
+        // Searching the same position twice with one table must reuse work:
+        // fewer nodes the second time, same best move.
+        let pos = Position::startpos();
+        let limits = parse_go(&["depth", "4"]);
+        let mut tt = Table::new(1);
+        let first = search(&pos, &limits, &no_control(), &mut tt, &silent);
+        let second = search(&pos, &limits, &no_control(), &mut tt, &silent);
+        assert_eq!(first.bestmove, second.bestmove);
+        assert!(
+            second.nodes < first.nodes,
+            "no reuse: {} vs {}",
+            second.nodes,
+            first.nodes
+        );
     }
 
     #[test]
     fn search_emits_info_per_completed_iteration() {
         let pos = Position::startpos();
-        let lines: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-        let result = search(&pos, &parse_go(&["depth", "2"]), &no_control(), &|line| {
-            lines.lock().unwrap().push(line.to_string());
-        });
+        let (result, lines) = run_search(&pos, &["depth", "2"]);
         assert_eq!(result.depth, 2);
-        let lines = lines.lock().unwrap();
         assert!(
             lines.iter().any(|l| l.starts_with("info depth 1")),
             "missing depth-1 info: {lines:?}"
@@ -817,7 +1154,7 @@ mod tests {
     #[test]
     fn search_respects_movetime() {
         let pos = Position::startpos();
-        let result = search(&pos, &parse_go(&["movetime", "50"]), &no_control(), &silent);
+        let (result, _) = run_search(&pos, &["movetime", "50"]);
         assert!(
             result.elapsed < Duration::from_secs(3),
             "{:?}",

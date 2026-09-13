@@ -54,7 +54,10 @@ and time-to-depth. JSON is saved to `tools/results/`.
 `tools/make_tactical_epd.py` (seed 7) and every line was independently
 re-verified: each `bm` provably mates in N. Regenerate deterministically with
 the same command. `bench.py` scores the engine with `go movetime 200` per
-position.
+position. A bestmove scores when it mates (in 1) or forces mate (in 2),
+verified with python-chess — not only when it equals a listed `bm`, because
+positions can hold several mates and the engine may find a shorter one than
+the stored solution.
 
 ## Matches vs Stockfish (Elo anchor)
 

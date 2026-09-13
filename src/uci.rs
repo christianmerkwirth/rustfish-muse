@@ -27,7 +27,9 @@ pub struct EngineInfo {
 /// Mutable engine state owned by the UCI loop.
 pub struct EngineState {
     pub pos: Position,
-    pub hash_mb: u32,
+    /// Shared transposition table; the search worker holds the lock while
+    /// thinking, the command loop touches it only while idle.
+    pub tt: Arc<Mutex<crate::tt::Table>>,
     pub threads: u32,
     pub ponder_enabled: bool,
     pub debug: bool,
@@ -37,7 +39,7 @@ impl Default for EngineState {
     fn default() -> Self {
         Self {
             pos: Position::startpos(),
-            hash_mb: 16,
+            tt: Arc::new(Mutex::new(crate::tt::Table::new(16))),
             threads: 1,
             ponder_enabled: false,
             debug: false,
@@ -181,7 +183,12 @@ fn apply_option(state: &mut EngineState, opt: &SetOption) {
             if let Some(v) = opt.value.as_deref()
                 && let Ok(mb) = v.trim().parse::<u32>()
             {
-                state.hash_mb = mb.clamp(1, 1024);
+                let mb = mb.clamp(1, 1024);
+                state
+                    .tt
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .resize(mb);
             }
         }
         "threads" => {
@@ -222,15 +229,18 @@ struct ActiveSearch {
 /// finishes, hits a limit, or is stopped.
 fn spawn_search<W: Write + Send + 'static>(
     out: &Arc<Mutex<W>>,
+    tt: &Arc<Mutex<crate::tt::Table>>,
     pos: &Position,
     limits: GoLimits,
 ) -> ActiveSearch {
     let control = Arc::new(search::Control::new());
     let worker_control = Arc::clone(&control);
     let worker_out = Arc::clone(out);
+    let worker_tt = Arc::clone(tt);
     let worker_pos = pos.clone();
     let handle = thread::spawn(move || {
-        let result = search::search(&worker_pos, &limits, &worker_control, &|line| {
+        let mut tt = worker_tt.lock().unwrap_or_else(|e| e.into_inner());
+        let result = search::search(&worker_pos, &limits, &worker_control, &mut tt, &|line| {
             emit(&worker_out, line);
         });
         match result.ponder {
@@ -352,6 +362,7 @@ pub fn run_loop<R: BufRead, W: Write + Send + 'static>(input: R, output: W, info
             }
             "ucinewgame" => {
                 state.pos = Position::startpos();
+                state.tt.lock().unwrap_or_else(|e| e.into_inner()).clear();
             }
             "position" => match parse_position(args) {
                 Some(parsed) => {
@@ -383,7 +394,7 @@ pub fn run_loop<R: BufRead, W: Write + Send + 'static>(input: R, output: W, info
             },
             "go" => {
                 let limits = search::parse_go(&args.split_whitespace().collect::<Vec<_>>());
-                active = Some(spawn_search(&out, &state.pos, limits));
+                active = Some(spawn_search(&out, &state.tt, &state.pos, limits));
             }
             "stop" => {
                 // No search running: nothing to do.
@@ -505,7 +516,8 @@ mod tests {
 
     fn search_at_depth(pos: &Position, depth: u64) -> String {
         let limits = search::parse_go(&["depth", &depth.to_string()]);
-        search::search(pos, &limits, &search::Control::new(), &|_| {}).bestmove
+        let mut tt = crate::tt::Table::new(1);
+        search::search(pos, &limits, &search::Control::new(), &mut tt, &|_| {}).bestmove
     }
 
     #[test]
