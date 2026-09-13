@@ -1,0 +1,15 @@
+[package]
+name = "rustfish"
+version = "0.1.0"
+edition = "2021"
+description = "A UCI compatible chess engine in Rust"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "rustfish"
+path = "src/main.rs"
+
+[dependencies]
+shakmaty = "0.30"
+
+[dev-dependencies]
