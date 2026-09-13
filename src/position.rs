@@ -10,10 +10,23 @@ use shakmaty::{
     Board, CastlingMode, Chess, Color, EnPassantMode, Move, Position as ShakmatyPosition,
 };
 
-/// Owned chess position.
+/// Zobrist key of a concrete board state (turn, pieces, rights, legal ep).
+pub fn zobrist_key(inner: &Chess) -> u64 {
+    inner
+        .zobrist_hash::<shakmaty::zobrist::Zobrist64>(EnPassantMode::Legal)
+        .0
+}
+
+/// Owned chess position plus its game-path Zobrist history for repetition
+/// detection. `history[0]` is the game start; each applied move pushes one key.
+/// `key` caches the current key so the search never hashes twice; search
+/// temporaries (see [`Position::play_temp`]) carry an empty history and only
+/// the key, since repetition bookkeeping lives on the search stack.
 #[derive(Clone, Debug)]
 pub struct Position {
     inner: Chess,
+    history: Vec<u64>,
+    key: u64,
 }
 
 impl Default for Position {
@@ -25,8 +38,13 @@ impl Default for Position {
 impl Position {
     /// The standard initial position.
     pub fn startpos() -> Self {
+        let inner = Chess::default();
+        let key = zobrist_key(&inner);
+        let history = vec![key];
         Self {
-            inner: Chess::default(),
+            inner,
+            history,
+            key,
         }
     }
 
@@ -39,7 +57,39 @@ impl Position {
         let inner: Chess = setup
             .into_position(CastlingMode::Standard)
             .map_err(|e| format!("invalid FEN {fen:?}: {e}"))?;
-        Ok(Self { inner })
+        // History starts at the given FEN; earlier repetitions are invisible,
+        // matching UCI semantics.
+        let key = zobrist_key(&inner);
+        let history = vec![key];
+        Ok(Self {
+            inner,
+            history,
+            key,
+        })
+    }
+
+    /// Zobrist key of the current position.
+    pub fn key(&self) -> u64 {
+        self.key
+    }
+
+    /// Game-path keys from the game start to the current position.
+    pub fn history(&self) -> &[u64] {
+        &self.history
+    }
+
+    /// The position after a null move (side to move passes, en passant
+    /// rights dropped). `None` when illegal — notably while in check.
+    pub fn null_move(&self) -> Option<Position> {
+        let inner = self.inner.clone().swap_turn().ok()?;
+        let key = zobrist_key(&inner);
+        let mut history = self.history.clone();
+        history.push(key);
+        Some(Self {
+            inner,
+            history,
+            key,
+        })
     }
 
     /// Render the current position as a FEN string.
@@ -51,6 +101,8 @@ impl Position {
     /// error is returned and `self` is unchanged.
     pub fn apply_uci_moves(&mut self, moves: &[String]) -> Result<(), String> {
         let mut next = self.inner.clone();
+        let mut keys = self.history.clone();
+        let mut key = self.key;
         for m in moves {
             let uci: UciMove = m
                 .parse()
@@ -61,8 +113,12 @@ impl Position {
             next = next
                 .play(mv)
                 .map_err(|e| format!("illegal move {m:?}: {e}"))?;
+            key = zobrist_key(&next);
+            keys.push(key);
         }
         self.inner = next;
+        self.history = keys;
+        self.key = key;
         Ok(())
     }
 
@@ -117,9 +173,35 @@ impl Position {
         self.inner.legal_moves().into_iter().collect()
     }
 
-    /// The position after playing a legal move.
+    /// The position after playing a legal move, with full history.
+    /// Production search uses [`Position::play_temp`]; this stays for tests
+    /// and game-path construction.
+    #[allow(dead_code)]
     pub fn play(&self, m: &Move) -> Option<Position> {
-        self.inner.clone().play(*m).ok().map(|inner| Self { inner })
+        let inner = self.inner.clone().play(*m).ok()?;
+        let key = zobrist_key(&inner);
+        let mut history = self.history.clone();
+        history.push(key);
+        Some(Self {
+            inner,
+            history,
+            key,
+        })
+    }
+
+    /// The position after playing a legal move, without history. Used by the
+    /// search, which makes thousands of temporaries per second: no allocation
+    /// beyond the board clone, and the key is computed once. Repetition
+    /// bookkeeping lives on the search stack, so callers must not use the
+    /// empty history for game-path purposes.
+    pub fn play_temp(&self, m: &Move) -> Option<Position> {
+        let inner = self.inner.clone().play(*m).ok()?;
+        let key = zobrist_key(&inner);
+        Some(Self {
+            inner,
+            history: Vec::new(),
+            key,
+        })
     }
 
     /// Access the underlying `shakmaty` position.
@@ -190,6 +272,44 @@ mod tests {
         let before = pos.to_fen();
         assert!(pos.apply_uci_moves(&["zzz".to_string()]).is_err());
         assert_eq!(pos.to_fen(), before);
+    }
+
+    #[test]
+    fn history_tracks_repetitions() {
+        let mut pos = Position::startpos();
+        assert_eq!(pos.history().len(), 1);
+        let start_key = pos.key();
+        pos.apply_uci_moves(&["g1f3".to_string(), "g8f6".to_string()])
+            .unwrap();
+        assert_eq!(pos.history().len(), 3);
+        assert_ne!(pos.key(), start_key);
+        pos.apply_uci_moves(&["f3g1".to_string(), "f6g8".to_string()])
+            .unwrap();
+        // Knights home: the start position repeats for the second time.
+        assert_eq!(pos.key(), start_key);
+        assert_eq!(pos.history().iter().filter(|k| **k == start_key).count(), 2);
+    }
+
+    #[test]
+    fn play_temp_matches_play_keys() {
+        let pos = Position::startpos();
+        for m in pos.legal_moves() {
+            let full = pos.play(&m).unwrap();
+            let temp = pos.play_temp(&m).unwrap();
+            assert_eq!(full.key(), temp.key());
+            assert_eq!(full.to_fen(), temp.to_fen());
+            assert!(temp.history().is_empty());
+        }
+    }
+
+    #[test]
+    fn null_move_passes_turn() {
+        use shakmaty::Position as _;
+        let pos = Position::startpos();
+        let nulled = pos.null_move().unwrap();
+        assert_eq!(nulled.inner().turn(), shakmaty::Color::Black);
+        assert_ne!(nulled.key(), pos.key());
+        assert_eq!(nulled.history().len(), 2);
     }
 
     #[test]

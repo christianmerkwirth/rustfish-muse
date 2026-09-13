@@ -98,13 +98,62 @@ def load_epd(path: str) -> list[tuple[str, list[str], str]]:
     return entries
 
 
+def mates_immediately(fen: str, move: str) -> bool:
+    try:
+        board = chess.Board(fen)
+        board.push_uci(move)
+        return board.is_checkmate()
+    except (ValueError, chess.IllegalMoveError):
+        return False
+
+
+def has_mate_in_1(board: chess.Board) -> bool:
+    for m in board.legal_moves:
+        board.push(m)
+        mated = board.is_checkmate()
+        board.pop()
+        if mated:
+            return True
+    return False
+
+
+def forces_mate_in_2(fen: str, move: str) -> bool:
+    """Bestmove mates at once or forces mate on the following move."""
+    try:
+        board = chess.Board(fen)
+        board.push_uci(move)
+    except (ValueError, chess.IllegalMoveError):
+        return False
+    if board.is_checkmate():
+        return True
+    if board.is_game_over():
+        return False
+    for reply in list(board.legal_moves):
+        board.push(reply)
+        try:
+            if board.is_game_over():
+                if not board.is_checkmate():
+                    return False
+                continue
+            if not has_mate_in_1(board):
+                return False
+        finally:
+            board.pop()
+    assert len(board.move_stack) == 1
+    return True
+
+
 def measure_tactical(engine_path: str, movetime_ms: int) -> dict:
     eng = Engine(engine_path)
+    # Suites may hold positions with several mating moves, so a bestmove
+    # scores when it mates (in 1) or forces mate (in 2) — not only when it
+    # equals a listed `bm`. The `bm` fields stay as documented solutions.
+    checkers = {"mate_in_1.epd": mates_immediately, "mate_in_2.epd": forces_mate_in_2}
     summary: dict[str, dict] = {}
     try:
         eng.send("uci")
         eng.wait_for(lambda l: l == "uciok", 5.0)
-        for name in ["mate_in_1.epd", "mate_in_2.epd"]:
+        for name, check in checkers.items():
             entries = load_epd(os.path.join(DATA_DIR, name))
             solved = 0
             details = []
@@ -116,7 +165,7 @@ def measure_tactical(engine_path: str, movetime_ms: int) -> dict:
                     best, _ = eng.wait_bestmove(movetime_ms / 1000 + 10.0)
                 except EngineError:
                     best = "<timeout>"
-                hit = best in bms
+                hit = check(fen, best)
                 solved += hit
                 details.append({"id": pid, "bestmove": best, "expected": bms, "hit": hit})
             summary[name] = {

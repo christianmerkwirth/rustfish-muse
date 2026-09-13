@@ -3,6 +3,7 @@
 mod eval;
 mod position;
 mod search;
+mod tt;
 mod uci;
 
 fn main() {
