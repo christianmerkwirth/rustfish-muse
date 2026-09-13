@@ -561,9 +561,7 @@ mod tests {
             .collect();
         assert_eq!(moves.len(), 2, "got:\n{out}");
         let mut after_e4 = Position::startpos();
-        after_e4
-            .apply_uci_moves(&["e2e4".to_string()])
-            .unwrap();
+        after_e4.apply_uci_moves(&["e2e4".to_string()]).unwrap();
         assert_eq!(moves[1], search_at_depth(&after_e4, 1));
     }
 
