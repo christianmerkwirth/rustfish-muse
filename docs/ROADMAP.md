@@ -41,7 +41,19 @@ solved.
 
 Gate: beats Stockfish Elo 2000 over 50+ pairs with LOS > 99%.
 
-## v0.5 — NNUE and the 2400 target (~2300–2500+)
+Result (2026-09-13): shipped eval + aspiration + a stale-PV fix; SMP slipped
+to v0.5 (needs a lockless TT) and systematic SPSA tuning was deferred (needs
+more game volume than one thread can generate). Placed ≈SF 1800, ~+20 over
+v0.3 — gate missed by ~150. See BASELINE.
+
+## v0.5 — SMP scaling (~1950–2100)
+
+- Lazy SMP honouring the Threads option (lockless TT with atomics), better
+  time management, eval-speed work (static-eval caching)
+
+Gate: beats Stockfish Elo 2000 over 50+ pairs with LOS > 99%.
+
+## v0.6 — NNUE and the 2400 target (~2300–2500+)
 
 - NNUE inference in Rust (halfKP-style features, incremental updates),
   trained on Stockfish-evaluated Rustfish self-play data
