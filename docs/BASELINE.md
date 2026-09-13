@@ -85,3 +85,54 @@ Matches play the release build; protocol tests use either build.
 `tools/results/bench_20260913T193536Z.json` (release),
 `tools/results/match_20260913T192511Z.json` + `.pgn` (leg 1, +32−18),
 `tools/results/match_20260913T193056Z.json` + `.pgn` (leg 2, +29−21).
+
+---
+
+# v0.3 selective search (this milestone)
+
+Engine: v0.2 + Zobrist transposition table (bounds, mate adjustment,
+generations, Hash option, `hashfull` reporting), null-move pruning (R=2/3,
+non-pawn guard), LMR with PVS re-search, reverse futility, razoring, check
+extensions, threefold-repetition scoring, allocation-free search temps.
+
+## Correctness
+
+- `cargo test`: **57/57 pass** (adds TT roundtrips/mate-adjust/replacement,
+  repetition counting, TT-reuse node reduction, mate-in-2 vs pruning,
+  play_temp key equivalence); clippy `-D warnings` clean, fmt clean
+- UCI compliance CLI: **60/60**, pytest **15/15** (unchanged suite, still green)
+- Perft unchanged (no movegen changes)
+
+## Speed and tactics (`bench.py`, release)
+
+- 1282 pos/s at `go depth 1`; depth-6 startpos: 24,103 nodes (v0.2: 163,549 —
+  **6.8× smaller trees**), 2.61M nps after the play_temp optimization
+  (1.52M before, same node counts: behavior-identical speedup)
+- mate_in_1: **20/20**; mate_in_2: **10/10** — bench now verifies mates
+  instead of matching `bm` (three EPDs hold shorter mates than listed)
+
+## Matches (release build, 10+0.1, 12-line book)
+
+- vs Stockfish `UCI_Elo=1320`, 50 games: **+28 =0 −22 (56%)**, +41.9±97.0
+- vs `UCI_Elo=1600`, 20 games: **+10 =0 −10 (50%)** (v0.2 context: 8−12, 40%)
+- vs `UCI_Elo=1800`, 20 games: **+9 =1 −10 (47.5%)**
+- Head-to-head v0.3 vs v0.2, 100 games: **+41 =17 −42 (49.5%)**, ≈0 Elo
+- Zero illegal-move terminations everywhere
+
+## Honest gate read
+
+Mixed. "Competitive with 1600–1800" is met (even scores, and ahead of v0.2's
+40% vs 1600). "Mate-in-2 mostly solved" is met (10/10). But the 1320 bar
+(>65%) is still missed, and the 100-game A/B says selectivity adds no Elo at
+bullet: both versions already out-tactic weak opposition, and the PST eval is
+now the binding constraint — extra depth does not convert. v0.4 (deeper eval:
+king safety, pawn structure, tuned values) attacks exactly that ceiling.
+
+## Raw artifacts (v0.3)
+
+`tools/results/bench_20260913T195124Z.json`,
+`tools/results/bench_20260913T195302Z.json` (mate-verified scoring),
+`tools/results/match_20260913T195314Z.json` (1320, +28−22),
+`tools/results/match_20260913T195509Z.json` (1600, +10−10),
+`tools/results/match_20260913T195608Z.json` (1800, +9=1−10),
+`tools/results/selfplay_v03_v02.pgn` + `_b.pgn` (A/B, 49.5%).
