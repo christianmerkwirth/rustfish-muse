@@ -19,10 +19,14 @@ pub fn zobrist_key(inner: &Chess) -> u64 {
 
 /// Owned chess position plus its game-path Zobrist history for repetition
 /// detection. `history[0]` is the game start; each applied move pushes one key.
+/// `key` caches the current key so the search never hashes twice; search
+/// temporaries (see [`Position::play_temp`]) carry an empty history and only
+/// the key, since repetition bookkeeping lives on the search stack.
 #[derive(Clone, Debug)]
 pub struct Position {
     inner: Chess,
     history: Vec<u64>,
+    key: u64,
 }
 
 impl Default for Position {
@@ -35,8 +39,13 @@ impl Position {
     /// The standard initial position.
     pub fn startpos() -> Self {
         let inner = Chess::default();
-        let history = vec![zobrist_key(&inner)];
-        Self { inner, history }
+        let key = zobrist_key(&inner);
+        let history = vec![key];
+        Self {
+            inner,
+            history,
+            key,
+        }
     }
 
     /// Parse a FEN string (six fields, standard castling, e.g. from the
@@ -50,13 +59,18 @@ impl Position {
             .map_err(|e| format!("invalid FEN {fen:?}: {e}"))?;
         // History starts at the given FEN; earlier repetitions are invisible,
         // matching UCI semantics.
-        let history = vec![zobrist_key(&inner)];
-        Ok(Self { inner, history })
+        let key = zobrist_key(&inner);
+        let history = vec![key];
+        Ok(Self {
+            inner,
+            history,
+            key,
+        })
     }
 
     /// Zobrist key of the current position.
     pub fn key(&self) -> u64 {
-        *self.history.last().expect("non-empty history")
+        self.key
     }
 
     /// Game-path keys from the game start to the current position.
@@ -68,9 +82,14 @@ impl Position {
     /// rights dropped). `None` when illegal — notably while in check.
     pub fn null_move(&self) -> Option<Position> {
         let inner = self.inner.clone().swap_turn().ok()?;
+        let key = zobrist_key(&inner);
         let mut history = self.history.clone();
-        history.push(zobrist_key(&inner));
-        Some(Self { inner, history })
+        history.push(key);
+        Some(Self {
+            inner,
+            history,
+            key,
+        })
     }
 
     /// Render the current position as a FEN string.
@@ -83,6 +102,7 @@ impl Position {
     pub fn apply_uci_moves(&mut self, moves: &[String]) -> Result<(), String> {
         let mut next = self.inner.clone();
         let mut keys = self.history.clone();
+        let mut key = self.key;
         for m in moves {
             let uci: UciMove = m
                 .parse()
@@ -93,10 +113,12 @@ impl Position {
             next = next
                 .play(mv)
                 .map_err(|e| format!("illegal move {m:?}: {e}"))?;
-            keys.push(zobrist_key(&next));
+            key = zobrist_key(&next);
+            keys.push(key);
         }
         self.inner = next;
         self.history = keys;
+        self.key = key;
         Ok(())
     }
 
@@ -151,14 +173,35 @@ impl Position {
         self.inner.legal_moves().into_iter().collect()
     }
 
-    /// The position after playing a legal move. History extends the parent's
-    /// so search temporaries carry correct keys (the search stack handles
-    /// repetition bookkeeping separately).
+    /// The position after playing a legal move, with full history.
+    /// Production search uses [`Position::play_temp`]; this stays for tests
+    /// and game-path construction.
+    #[allow(dead_code)]
     pub fn play(&self, m: &Move) -> Option<Position> {
         let inner = self.inner.clone().play(*m).ok()?;
+        let key = zobrist_key(&inner);
         let mut history = self.history.clone();
-        history.push(zobrist_key(&inner));
-        Some(Self { inner, history })
+        history.push(key);
+        Some(Self {
+            inner,
+            history,
+            key,
+        })
+    }
+
+    /// The position after playing a legal move, without history. Used by the
+    /// search, which makes thousands of temporaries per second: no allocation
+    /// beyond the board clone, and the key is computed once. Repetition
+    /// bookkeeping lives on the search stack, so callers must not use the
+    /// empty history for game-path purposes.
+    pub fn play_temp(&self, m: &Move) -> Option<Position> {
+        let inner = self.inner.clone().play(*m).ok()?;
+        let key = zobrist_key(&inner);
+        Some(Self {
+            inner,
+            history: Vec::new(),
+            key,
+        })
     }
 
     /// Access the underlying `shakmaty` position.
@@ -245,6 +288,18 @@ mod tests {
         // Knights home: the start position repeats for the second time.
         assert_eq!(pos.key(), start_key);
         assert_eq!(pos.history().iter().filter(|k| **k == start_key).count(), 2);
+    }
+
+    #[test]
+    fn play_temp_matches_play_keys() {
+        let pos = Position::startpos();
+        for m in pos.legal_moves() {
+            let full = pos.play(&m).unwrap();
+            let temp = pos.play_temp(&m).unwrap();
+            assert_eq!(full.key(), temp.key());
+            assert_eq!(full.to_fen(), temp.to_fen());
+            assert!(temp.history().is_empty());
+        }
     }
 
     #[test]

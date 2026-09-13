@@ -173,7 +173,7 @@ pub fn perft(pos: &Position, depth: u32) -> u64 {
     }
     let mut total = 0;
     for m in moves {
-        if let Some(next) = pos.play(&m) {
+        if let Some(next) = pos.play_temp(&m) {
             total += perft(&next, depth - 1);
         }
     }
@@ -389,7 +389,9 @@ impl<'a> Search<'a> {
         }
         self.sort_moves(&mut moves, pos, None, ply);
         for m in &moves {
-            let Some(next) = pos.play(m) else { continue };
+            let Some(next) = pos.play_temp(m) else {
+                continue;
+            };
             let score = -self.quiescence(&next, ply + 1, -beta, -alpha);
             if self.stopped {
                 return 0;
@@ -563,7 +565,9 @@ impl<'a> Search<'a> {
         let mut best_move: Option<Move> = None;
         let mut idx = 0;
         for m in &moves {
-            let Some(next) = pos.play(m) else { continue };
+            let Some(next) = pos.play_temp(m) else {
+                continue;
+            };
             let quiet = !m.is_capture() && !m.is_promotion();
             // Frontier futility: hopeless quiets at depth 1 (captures tried).
             if idx > 0
@@ -806,7 +810,9 @@ pub fn search(
 
         let mut idx = 0;
         for m in &ordered {
-            let Some(next) = pos.play(m) else { continue };
+            let Some(next) = pos.play_temp(m) else {
+                continue;
+            };
             // Principal-variation search at the root: full window first,
             // null windows with full-window research afterwards.
             let mut s = if idx == 0 {
